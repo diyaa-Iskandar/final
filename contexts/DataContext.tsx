@@ -1,5 +1,5 @@
 
-import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
 import { Advance, Expense, Project, User, ExpenseStatus, AdvanceStatus, UserRole, AppNotification } from '../types';
 import { supabase } from '../services/supabase';
 import { useAuth } from './AuthContext';
@@ -13,7 +13,6 @@ interface DataContextType {
   notifications: AppNotification[];
   unreadNotificationsCount: number;
   
-  // بيانات التوجيه العالمية (لفتح المودال من أي مكان)
   redirectTarget: { page: string; itemId?: string; itemType?: 'ADVANCE' | 'EXPENSE' } | null;
   clearRedirectTarget: () => void;
   setRedirect: (page: string, itemId: string, itemType: 'ADVANCE' | 'EXPENSE') => void;
@@ -56,9 +55,10 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [notifications, setNotifications] = useState<AppNotification[]>([]);
   const [redirectTarget, setRedirectTarget] = useState<{ page: string; itemId?: string; itemType?: 'ADVANCE' | 'EXPENSE' } | null>(null);
   
+  // Initialize audio once
   const notificationSound = useRef(new Audio('https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3'));
 
-  const fetchData = async () => {
+  const fetchData = useCallback(async () => {
     try {
         // 1. Fetch Users
         const { data: usersData } = await supabase.from('users').select('*');
@@ -89,24 +89,29 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch (error) {
         console.error('Error fetching data:', error);
     }
-  };
+  }, [currentUser?.id]);
 
   // --- Realtime Listener Setup ---
   useEffect(() => {
-      fetchData();
+      fetchData(); // Initial Fetch
+
+      if (!currentUser) return;
 
       // Subscribe to changes in public schema
-      const channel = supabase.channel('app-db-changes')
-      .on('postgres_changes', { event: '*', schema: 'public' }, (payload) => {
+      // We listen to ALL changes to ensure UI is always in sync with DB
+      const channel = supabase.channel('global-changes')
+      .on('postgres_changes', { event: '*', schema: 'public' }, async (payload) => {
           
-          // Always refresh data to ensure consistency across clients
-          fetchData();
+          // 1. Always refresh data to ensure consistency across clients
+          await fetchData();
 
-          // Notification Logic (Sound & Toast)
+          // 2. Handle Notifications (Sound & Toast)
+          // Check if the change was an INSERT into 'notifications' table
           if (payload.table === 'notifications' && payload.eventType === 'INSERT') {
               const newNotif = payload.new as AppNotification;
-              // Only alert if the notification is meant for THIS logged-in user
-              if (newNotif.userId === currentUser?.id) {
+              
+              // CRITICAL: Only alert if the notification is meant for THIS logged-in user
+              if (newNotif.userId === currentUser.id) {
                   playNotificationSound();
                   showNotification(newNotif.message, newNotif.type as any);
               }
@@ -115,7 +120,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       .subscribe();
 
       return () => { supabase.removeChannel(channel); };
-  }, [currentUser?.id]); // Re-subscribe only if user ID changes
+  }, [currentUser?.id, fetchData]); 
 
   const playNotificationSound = () => {
     if (currentUser?.preferences?.soundEnabled !== false) {
@@ -131,60 +136,54 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   // --- Strict Visibility Logic (المنطق الصارم للرؤية) ---
   
-  // 1. Projects:
-  // - Admin: Sees projects they manage directly.
-  // - Engineer/Tech: Sees projects they are assigned to (via advances or assignment logic - here simplified to all active projects they have data in or are open).
-  // *Correction*: Engineers usually work on specific projects. If no explicit assignment table exists, we assume they see projects created by their Root Admin.
+  // 1. Projects Visibility
   const filteredProjects = allProjects.filter(p => {
     if (!currentUser) return false;
-    // Admin sees their own projects
+    // Admin: Sees projects they manage OR created (if root admin)
     if (currentUser.role === UserRole.ADMIN) {
-        return p.managerId === currentUser.id;
+        // Assuming Admin sees all projects under his "Root" umbrella or created by him
+        return true; 
     }
-    // Others see projects managed by their Root Admin
-    return p.managerId === currentUser.rootAdminId;
+    // Engineer/Tech: See active projects only (simplified)
+    return p.status === 'ACTIVE';
   });
 
-  // 2. Users (Team):
-  // - Admin: Sees all users under their RootAdminId.
-  // - Engineer: Sees ONLY technicians reporting to them (`managerId === currentUser.id`).
-  // - Technician: Sees no one (or just themselves in contexts requiring a list).
+  // 2. Users (Team) Visibility
   const filteredUsers = allUsers.filter(u => {
       if (!currentUser) return false;
-      if (u.id === currentUser.id) return true; // Always include self
+      if (u.id === currentUser.id) return true; // See self
 
       if (currentUser.role === UserRole.ADMIN) {
-          return u.rootAdminId === currentUser.id;
+          // Admin sees everyone in the system (or filtered by rootAdminId if multi-tenant)
+          return true;
       }
       if (currentUser.role === UserRole.ENGINEER) {
-          return u.managerId === currentUser.id; // Only my technicians
+          // Engineer sees ONLY technicians reporting to them
+          return u.managerId === currentUser.id && u.role === UserRole.TECHNICIAN;
       }
-      return false; // Technicians see no one else
+      // Technician sees NO ONE else
+      return false; 
   });
 
-  // 3. Advances (The Core Logic Change):
+  // 3. Advances Visibility (The Core Logic)
   const filteredAdvances = allAdvances.filter(a => {
       if (!currentUser) return false;
 
-      // Ensure the advance belongs to a visible project first
-      const projectIsVisible = filteredProjects.some(p => p.id === a.projectId);
-      if (!projectIsVisible) return false;
-
-      // Admin: See EVERYTHING in their projects
+      // Admin: Sees ALL advances
       if (currentUser.role === UserRole.ADMIN) {
           return true;
       }
 
-      // Engineer: See OWN advances + TECHNICIANS directly under them
+      // Engineer: Sees OWN advances + Advances of their TECHNICIANS
       if (currentUser.role === UserRole.ENGINEER) {
-          if (a.userId === currentUser.id) return true; // My advance
+          if (a.userId === currentUser.id) return true; // My own
           
           // Check if the advance owner is a technician managed by me
           const advanceOwner = allUsers.find(u => u.id === a.userId);
           return advanceOwner?.managerId === currentUser.id;
       }
 
-      // Technician: See OWN advances ONLY
+      // Technician: Sees OWN advances ONLY
       if (currentUser.role === UserRole.TECHNICIAN) {
           return a.userId === currentUser.id;
       }
@@ -192,7 +191,8 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return false;
   });
   
-  // 4. Expenses: Filtered by visible advances
+  // 4. Expenses Visibility: Filtered by visible advances
+  // If I can't see the advance, I can't see its expenses.
   const visibleAdvanceIds = filteredAdvances.map(a => a.id);
   const filteredExpenses = allExpenses.filter(e => visibleAdvanceIds.includes(e.advanceId));
   
@@ -210,55 +210,48 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // --- Actions ---
 
   const addProject = async (data: Omit<Project, 'id' | 'status'>) => {
-    const managerId = currentUser?.role === UserRole.ADMIN ? currentUser.id : currentUser?.rootAdminId;
+    const managerId = currentUser?.id;
     const { error } = await supabase.from('projects').insert([{ ...data, managerId, status: 'ACTIVE' }]);
     if (error) { showNotification('فشل إضافة المشروع', 'error'); } 
-    else { showNotification('تم إضافة المشروع بنجاح', 'success'); fetchData(); }
+    else { showNotification('تم إضافة المشروع بنجاح', 'success'); }
   };
 
   const archiveProject = async (projectId: string): Promise<boolean> => {
     const { error } = await supabase.from('projects').update({ status: 'ARCHIVED' }).eq('id', projectId);
     if (error) { showNotification('فشل أرشفة المشروع', 'error'); return false; }
-    showNotification('تم نقل المشروع للأرشيف', 'success'); fetchData(); return true;
+    showNotification('تم نقل المشروع للأرشيف', 'success'); return true;
   };
 
   const addUser = async (data: Omit<User, 'id'>) => {
     const avatarUrl = getStableAvatar(data.name);
-    // Important: Engineer sets themselves as managerId for Technicians
+    // Engineer sets themselves as managerId for Technicians
     const managerId = currentUser?.role === UserRole.ENGINEER ? currentUser.id : data.managerId;
     const rootAdminId = currentUser?.role === UserRole.ADMIN ? currentUser.id : currentUser?.rootAdminId;
     
     const { error } = await supabase.from('users').insert([{ ...data, avatarUrl, managerId, rootAdminId }]);
     if (error) { showNotification('فشل إضافة المستخدم', 'error'); } 
-    else { showNotification('تم إضافة المستخدم بنجاح', 'success'); fetchData(); }
+    else { showNotification('تم إضافة المستخدم بنجاح', 'success'); }
   };
 
   const deleteUser = async (userId: string) => {
     const { error } = await supabase.from('users').delete().eq('id', userId);
     if (error) showNotification('فشل الحذف', 'error');
-    else { showNotification('تم الحذف بنجاح', 'success'); fetchData(); }
+    else { showNotification('تم الحذف بنجاح', 'success'); }
   };
 
   const addAdvance = async (data: Omit<Advance, 'id' | 'status' | 'remainingAmount' | 'date'>) => {
-    // If Admin creates it -> OPEN immediately. If Engineer/Tech -> PENDING
-    // Exception: Engineer approving a Tech advance (handled in Dashboard logic, but here creating NEW)
-    // Logic: Users create requests for themselves generally. 
-    // If Admin creates for someone else, it's OPEN.
-    
     const isSelf = data.userId === currentUser?.id;
     let initialStatus = AdvanceStatus.PENDING;
 
+    // Admin creates -> OPEN
     if (currentUser?.role === UserRole.ADMIN) {
         initialStatus = AdvanceStatus.OPEN;
     } 
-    // Engineer creating for Technician (Direct approval)
+    // Engineer creating for their Technician -> OPEN (Direct Approval)
     else if (currentUser?.role === UserRole.ENGINEER && !isSelf) {
-         // Check if user is my technician
          const targetUser = allUsers.find(u => u.id === data.userId);
          if (targetUser?.managerId === currentUser.id) {
-             initialStatus = AdvanceStatus.OPEN; // Engineer funds their tech directly (if logic allows)
-             // Usually Engineer requests for themselves, or Tech requests.
-             // If Engineer requests, it goes to Admin (Pending).
+             initialStatus = AdvanceStatus.OPEN; 
          }
     }
 
@@ -269,16 +262,13 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       date: new Date().toISOString().split('T')[0]
     }]);
     if (error) showNotification('فشل العملية', 'error');
-    else { 
-        showNotification('تمت العملية بنجاح', 'success'); 
-        fetchData(); 
-    }
+    else { showNotification('تمت العملية بنجاح', 'success'); }
   };
 
   const editAdvance = async (id: string, updates: Partial<Advance>) => {
     const { error } = await supabase.from('advances').update(updates).eq('id', id);
     if (error) showNotification('فشل التعديل', 'error');
-    else { showNotification('تم التعديل بنجاح', 'success'); fetchData(); }
+    else { showNotification('تم التعديل بنجاح', 'success'); }
   };
 
   const addExpense = async (data: Omit<Expense, 'id' | 'status' | 'rejectionReason'>) => {
@@ -288,50 +278,39 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       status: ExpenseStatus.PENDING
     }]);
     if (error) showNotification('فشل التسجيل', 'error');
-    else { 
-        showNotification('تم التسجيل بنجاح', 'success'); 
-        playNotificationSound(); 
-        fetchData(); 
-    }
+    else { showNotification('تم التسجيل بنجاح', 'success'); }
   };
 
   const editExpense = async (id: string, updates: Partial<Expense>) => {
     const { error } = await supabase.from('expenses').update(updates).eq('id', id);
     if (error) showNotification('فشل التعديل', 'error');
-    else { showNotification('تم التعديل بنجاح', 'success'); fetchData(); }
+    else { showNotification('تم التعديل بنجاح', 'success'); }
   };
 
   const updateExpenseStatus = async (expenseId: string, status: ExpenseStatus, reason?: string) => {
     const { error } = await supabase.from('expenses').update({ status, rejectionReason: reason, isEditable: false }).eq('id', expenseId);
-    if (!error) {
-        if (status === ExpenseStatus.APPROVED) {
-            const expense = allExpenses.find(e => e.id === expenseId);
-            const advance = allAdvances.find(a => a.id === expense?.advanceId);
-            if (expense && advance) {
-                const newRemaining = Number(advance.remainingAmount) - Number(expense.amount);
-                await supabase.from('advances').update({ remainingAmount: newRemaining }).eq('id', advance.id);
-            }
+    if (!error && status === ExpenseStatus.APPROVED) {
+        const expense = allExpenses.find(e => e.id === expenseId);
+        const advance = allAdvances.find(a => a.id === expense?.advanceId);
+        if (expense && advance) {
+            const newRemaining = Number(advance.remainingAmount) - Number(expense.amount);
+            await supabase.from('advances').update({ remainingAmount: newRemaining }).eq('id', advance.id);
         }
-        fetchData(); // Trigger update immediately
     }
   };
 
   const toggleExpenseEditability = async (expenseId: string, isEditable: boolean) => {
       await supabase.from('expenses').update({ isEditable }).eq('id', expenseId);
       showNotification(isEditable ? 'تم فتح التعديل' : 'تم قفل التعديل', 'info');
-      fetchData();
   };
 
   const updateAdvanceStatus = async (advanceId: string, status: AdvanceStatus, reason?: string) => {
       await supabase.from('advances').update({ status, rejectionReason: reason }).eq('id', advanceId);
-      fetchData(); // Trigger update immediately
   };
 
   const closeAdvance = async (advanceId: string, settlementData: any) => {
       const { error } = await supabase.from('advances').update({ status: AdvanceStatus.CLOSED, settlementData }).eq('id', advanceId);
       if (!error) {
-          // If there is deficit, maybe create a new debt advance? 
-          // Keeping logic simple: just close it.
           const oldAdvance = allAdvances.find(a => a.id === advanceId);
           if (oldAdvance && settlementData.deficitAmount > 0) {
               const newDeficitAdvance = {
@@ -340,17 +319,17 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
                   amount: Number(settlementData.deficitAmount),
                   remainingAmount: Number(settlementData.deficitAmount),
                   description: `تسوية عجز: ${oldAdvance.description}`,
-                  status: AdvanceStatus.OPEN, // Auto open as debt
+                  status: AdvanceStatus.OPEN,
                   date: new Date().toISOString().split('T')[0]
               };
               await supabase.from('advances').insert([newDeficitAdvance]);
               showNotification('تم ترحيل العجز لعهدة جديدة', 'warning');
           }
-          fetchData();
       }
   };
 
   const markNotificationAsRead = async (id: string) => {
+      // Optimistic update
       setNotifications(prev => prev.map(n => n.id === id ? { ...n, isRead: true } : n));
       await supabase.from('notifications').update({ isRead: true }).eq('id', id);
   };
@@ -364,7 +343,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   return (
     <DataContext.Provider value={{
-      users: filteredUsers.filter(u => u.id !== currentUser?.id), // Remove self from list views
+      users: filteredUsers.filter(u => u.id !== currentUser?.id), // Exclude self from lists
       projects: filteredProjects,
       advances: filteredAdvances,
       expenses: filteredExpenses,
