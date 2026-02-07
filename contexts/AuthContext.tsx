@@ -22,18 +22,47 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // محاولة استرجاع المستخدم من التخزين المحلي عند البدء
     const savedUser = localStorage.getItem('petrotec_user');
     if (savedUser) {
-      setUser(JSON.parse(savedUser));
+      const parsedUser = JSON.parse(savedUser);
+      // Check immediately if this user was deleted locally before rendering
+      if (!parsedUser.isDeleted) {
+          setUser(parsedUser);
+      } else {
+          localStorage.removeItem('petrotec_user');
+      }
     }
   }, []);
+
+  // --- Realtime Security Check: Force Logout if Deleted ---
+  useEffect(() => {
+      if (!user) return;
+
+      const channel = supabase.channel(`auth_security_${user.id}`)
+      .on(
+          'postgres_changes',
+          { event: 'UPDATE', schema: 'public', table: 'users', filter: `id=eq.${user.id}` },
+          (payload) => {
+              const updatedUser = payload.new as User;
+              if (updatedUser.isDeleted) {
+                  logout();
+                  showNotification('تم إيقاف/حذف حسابك من قبل الإدارة.', 'error');
+              }
+          }
+      )
+      .subscribe();
+
+      return () => { supabase.removeChannel(channel); };
+  }, [user?.id]);
 
   const login = async (email: string, pass: string): Promise<boolean> => {
     try {
       // البحث عن المستخدم في جدول users
+      // هام: التأكد أنه غير محذوف
       const { data, error } = await supabase
         .from('users')
         .select('*')
         .eq('email', email)
-        .eq('password', pass) // ملاحظة: في بيئة الإنتاج يفضل استخدام Hashing
+        .eq('password', pass)
+        .eq('isDeleted', false) 
         .single();
 
       if (error || !data) {

@@ -148,24 +148,25 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return p.status === 'ACTIVE';
   });
 
-  // 2. Users (Team) Visibility
+  // 2. Users (Team) Visibility - **MODIFIED TO HIDE DELETED**
   const filteredUsers = allUsers.filter(u => {
       if (!currentUser) return false;
+      if (u.isDeleted) return false; // Hide deleted users from active lists! (Dropdowns, Team Page)
       if (u.id === currentUser.id) return true; // See self
 
       if (currentUser.role === UserRole.ADMIN) {
-          // Admin sees everyone in the system (or filtered by rootAdminId if multi-tenant)
           return true;
       }
       if (currentUser.role === UserRole.ENGINEER) {
           // Engineer sees ONLY technicians reporting to them
           return u.managerId === currentUser.id && u.role === UserRole.TECHNICIAN;
       }
-      // Technician sees NO ONE else
       return false; 
   });
 
-  // 3. Advances Visibility (The Core Logic)
+  // 3. Advances Visibility
+  // Note: We use allUsers here to check managerId, so even if user is deleted (soft), 
+  // the logic `advanceOwner?.managerId === currentUser.id` still works because `allUsers` has the deleted record.
   const filteredAdvances = allAdvances.filter(a => {
       if (!currentUser) return false;
 
@@ -191,8 +192,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return false;
   });
   
-  // 4. Expenses Visibility: Filtered by visible advances
-  // If I can't see the advance, I can't see its expenses.
+  // 4. Expenses Visibility
   const visibleAdvanceIds = filteredAdvances.map(a => a.id);
   const filteredExpenses = allExpenses.filter(e => visibleAdvanceIds.includes(e.advanceId));
   
@@ -234,9 +234,10 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const deleteUser = async (userId: string) => {
-    const { error } = await supabase.from('users').delete().eq('id', userId);
+    // Soft Delete: Just mark as deleted
+    const { error } = await supabase.from('users').update({ isDeleted: true }).eq('id', userId);
     if (error) showNotification('فشل الحذف', 'error');
-    else { showNotification('تم الحذف بنجاح', 'success'); }
+    else { showNotification('تم حذف المستخدم بنجاح', 'success'); }
   };
 
   const addAdvance = async (data: Omit<Advance, 'id' | 'status' | 'remainingAmount' | 'date'>) => {
@@ -343,7 +344,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   return (
     <DataContext.Provider value={{
-      users: filteredUsers.filter(u => u.id !== currentUser?.id), // Exclude self from lists
+      users: filteredUsers.filter(u => u.id !== currentUser?.id), // Exclude self from lists, and deleted already filtered
       projects: filteredProjects,
       advances: filteredAdvances,
       expenses: filteredExpenses,

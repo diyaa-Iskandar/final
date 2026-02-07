@@ -23,6 +23,7 @@ create table users (
   "jobTitle" text,
   "managerId" uuid, 
   "rootAdminId" uuid, 
+  "isDeleted" boolean default false, -- حقل الحذف الناعم
   preferences jsonb default '{"soundEnabled": true}',
   "createdAt" timestamptz default now()
 );

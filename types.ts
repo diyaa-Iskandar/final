@@ -36,6 +36,7 @@ export interface User {
   jobTitle?: string;
   managerId?: string;
   rootAdminId?: string;
+  isDeleted?: boolean; // حقل الحذف الناعم
   preferences?: {
     soundEnabled: boolean;
   };
