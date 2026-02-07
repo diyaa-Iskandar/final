@@ -97,20 +97,13 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       if (!currentUser) return;
 
-      // Subscribe to changes in public schema
-      // We listen to ALL changes to ensure UI is always in sync with DB
       const channel = supabase.channel('global-changes')
       .on('postgres_changes', { event: '*', schema: 'public' }, async (payload) => {
-          
-          // 1. Always refresh data to ensure consistency across clients
           await fetchData();
 
-          // 2. Handle Notifications (Sound & Toast)
-          // Check if the change was an INSERT into 'notifications' table
+          // Handle Notifications
           if (payload.table === 'notifications' && payload.eventType === 'INSERT') {
               const newNotif = payload.new as AppNotification;
-              
-              // CRITICAL: Only alert if the notification is meant for THIS logged-in user
               if (newNotif.userId === currentUser.id) {
                   playNotificationSound();
                   showNotification(newNotif.message, newNotif.type as any);
@@ -134,54 +127,61 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setRedirectTarget({ page, itemId, itemType });
   };
 
-  // --- Strict Visibility Logic (المنطق الصارم للرؤية) ---
+  // --- Strict ISOLATION & Visibility Logic (منطق العزل التام) ---
   
   // 1. Projects Visibility
   const filteredProjects = allProjects.filter(p => {
     if (!currentUser) return false;
-    // Admin: Sees projects they manage OR created (if root admin)
+    
+    // Admin: Sees ONLY projects where THEY are the manager.
+    // This effectively isolates "Mohsen's Projects" from "Sameh's Projects".
     if (currentUser.role === UserRole.ADMIN) {
-        // Assuming Admin sees all projects under his "Root" umbrella or created by him
-        return true; 
+        return p.managerId === currentUser.id;
     }
-    // Engineer/Tech: See active projects only (simplified)
-    return p.status === 'ACTIVE';
+    
+    // Engineer/Tech: See projects managed by their Root Admin (The boss of their organization).
+    return p.managerId === currentUser.rootAdminId;
   });
 
-  // 2. Users (Team) Visibility - **MODIFIED TO HIDE DELETED**
+  // 2. Users (Team) Visibility
   const filteredUsers = allUsers.filter(u => {
       if (!currentUser) return false;
-      if (u.isDeleted) return false; // Hide deleted users from active lists! (Dropdowns, Team Page)
-      if (u.id === currentUser.id) return true; // See self
+      if (u.isDeleted) return false; // Hide soft-deleted users
+      if (u.id === currentUser.id) return true; // Always see self
 
+      // Admin: Sees ONLY users who have HIM as their rootAdminId.
+      // This ensures Mohsen never sees Sameh, because Sameh's rootAdminId is Sameh, and Mohsen's is Mohsen.
       if (currentUser.role === UserRole.ADMIN) {
-          return true;
+          return u.rootAdminId === currentUser.id;
       }
+
+      // Engineer: Sees ONLY technicians reporting directly to him.
       if (currentUser.role === UserRole.ENGINEER) {
-          // Engineer sees ONLY technicians reporting to them
           return u.managerId === currentUser.id && u.role === UserRole.TECHNICIAN;
       }
+
+      // Technician: Sees NO ONE else.
       return false; 
   });
 
   // 3. Advances Visibility
-  // Note: We use allUsers here to check managerId, so even if user is deleted (soft), 
-  // the logic `advanceOwner?.managerId === currentUser.id` still works because `allUsers` has the deleted record.
   const filteredAdvances = allAdvances.filter(a => {
       if (!currentUser) return false;
 
-      // Admin: Sees ALL advances
+      // Find the owner of the advance to check their hierarchy
+      // We look in allUsers (even deleted ones) to maintain history integrity
+      const advanceOwner = allUsers.find(u => u.id === a.userId);
+      if (!advanceOwner) return false;
+
+      // Admin: Sees advances ONLY from users in his organization tree.
       if (currentUser.role === UserRole.ADMIN) {
-          return true;
+          return advanceOwner.rootAdminId === currentUser.id;
       }
 
-      // Engineer: Sees OWN advances + Advances of their TECHNICIANS
+      // Engineer: Sees OWN advances + Advances of their DIRECT TECHNICIANS
       if (currentUser.role === UserRole.ENGINEER) {
           if (a.userId === currentUser.id) return true; // My own
-          
-          // Check if the advance owner is a technician managed by me
-          const advanceOwner = allUsers.find(u => u.id === a.userId);
-          return advanceOwner?.managerId === currentUser.id;
+          return advanceOwner.managerId === currentUser.id; // My technician
       }
 
       // Technician: Sees OWN advances ONLY
@@ -192,7 +192,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return false;
   });
   
-  // 4. Expenses Visibility
+  // 4. Expenses Visibility (Cascading from Advances)
   const visibleAdvanceIds = filteredAdvances.map(a => a.id);
   const filteredExpenses = allExpenses.filter(e => visibleAdvanceIds.includes(e.advanceId));
   
@@ -210,7 +210,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // --- Actions ---
 
   const addProject = async (data: Omit<Project, 'id' | 'status'>) => {
-    const managerId = currentUser?.id;
+    const managerId = currentUser?.id; // Admin is the manager of his projects
     const { error } = await supabase.from('projects').insert([{ ...data, managerId, status: 'ACTIVE' }]);
     if (error) { showNotification('فشل إضافة المشروع', 'error'); } 
     else { showNotification('تم إضافة المشروع بنجاح', 'success'); }
@@ -224,9 +224,23 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const addUser = async (data: Omit<User, 'id'>) => {
     const avatarUrl = getStableAvatar(data.name);
-    // Engineer sets themselves as managerId for Technicians
-    const managerId = currentUser?.role === UserRole.ENGINEER ? currentUser.id : data.managerId;
-    const rootAdminId = currentUser?.role === UserRole.ADMIN ? currentUser.id : currentUser?.rootAdminId;
+    
+    // Hierarchy Logic:
+    // If Admin creates Engineer: managerId = Admin, rootAdminId = Admin
+    // If Admin creates Technician (Direct): managerId = Admin, rootAdminId = Admin
+    // If Engineer creates Technician: managerId = Engineer, rootAdminId = Engineer's Root
+    
+    let managerId = data.managerId;
+    let rootAdminId = currentUser?.rootAdminId || currentUser?.id;
+
+    if (currentUser?.role === UserRole.ENGINEER) {
+        managerId = currentUser.id; // Enforce Engineer as manager
+    } else if (currentUser?.role === UserRole.ADMIN) {
+        // If Admin is adding someone, they are the manager unless specified otherwise (but logically they create top level mostly)
+        // If adding Engineer, Admin is manager. 
+        if (!managerId) managerId = currentUser.id;
+        rootAdminId = currentUser.id; // Admin is the Root
+    }
     
     const { error } = await supabase.from('users').insert([{ ...data, avatarUrl, managerId, rootAdminId }]);
     if (error) { showNotification('فشل إضافة المستخدم', 'error'); } 
@@ -234,7 +248,6 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const deleteUser = async (userId: string) => {
-    // Soft Delete: Just mark as deleted
     const { error } = await supabase.from('users').update({ isDeleted: true }).eq('id', userId);
     if (error) showNotification('فشل الحذف', 'error');
     else { showNotification('تم حذف المستخدم بنجاح', 'success'); }
@@ -244,11 +257,9 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const isSelf = data.userId === currentUser?.id;
     let initialStatus = AdvanceStatus.PENDING;
 
-    // Admin creates -> OPEN
     if (currentUser?.role === UserRole.ADMIN) {
         initialStatus = AdvanceStatus.OPEN;
     } 
-    // Engineer creating for their Technician -> OPEN (Direct Approval)
     else if (currentUser?.role === UserRole.ENGINEER && !isSelf) {
          const targetUser = allUsers.find(u => u.id === data.userId);
          if (targetUser?.managerId === currentUser.id) {
@@ -330,7 +341,6 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const markNotificationAsRead = async (id: string) => {
-      // Optimistic update
       setNotifications(prev => prev.map(n => n.id === id ? { ...n, isRead: true } : n));
       await supabase.from('notifications').update({ isRead: true }).eq('id', id);
   };
@@ -344,7 +354,7 @@ export const DataProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   return (
     <DataContext.Provider value={{
-      users: filteredUsers.filter(u => u.id !== currentUser?.id), // Exclude self from lists, and deleted already filtered
+      users: filteredUsers.filter(u => u.id !== currentUser?.id),
       projects: filteredProjects,
       advances: filteredAdvances,
       expenses: filteredExpenses,
